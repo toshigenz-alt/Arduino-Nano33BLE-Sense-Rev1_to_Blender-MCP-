@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+
+# Blender local backups / autosaves
+*.blend1
+*.blend2
+*.blend@
+
+# Arduino / editor noise
+*.tmp
+*.bak
+
+# Local environment
+.env
+.env.*
