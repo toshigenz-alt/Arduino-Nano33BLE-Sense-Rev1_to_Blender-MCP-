@@ -103,9 +103,54 @@ def normalize_sensor_mode(mode: str | None) -> str:
         "integrate": "integrate",
         "mix": "fusion",
         "fusion": "fusion",
+        "cane": "cane",
+        "stick": "cane",
     }
     key = (mode or "fusion").strip().lower()
     return aliases.get(key, key)
+
+
+def vector_norm(values: list[float]) -> float:
+    return math.sqrt(sum(v * v for v in values))
+
+
+def cross(a: list[float], b: list[float]) -> list[float]:
+    return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+
+
+def rotate_body_to_world(vec: list[float], pitch: float, roll: float, yaw: float) -> list[float]:
+    cos_p = math.cos(pitch)
+    sin_p = math.sin(pitch)
+    cos_r = math.cos(roll)
+    sin_r = math.sin(roll)
+    cos_y = math.cos(yaw)
+    sin_y = math.sin(yaw)
+
+    x, y, z = vec
+    return [
+        (cos_y * cos_p) * x + (cos_y * sin_p * sin_r - sin_y * cos_r) * y + (cos_y * sin_p * cos_r + sin_y * sin_r) * z,
+        (sin_y * cos_p) * x + (sin_y * sin_p * sin_r + cos_y * cos_r) * y + (sin_y * sin_p * cos_r - cos_y * sin_r) * z,
+        (-sin_p) * x + (cos_p * sin_r) * y + (cos_p * cos_r) * z,
+    ]
+
+
+def gravity_in_body_frame(gravity: float, pitch: float, roll: float, yaw: float) -> list[float]:
+    # Transpose of rotate_body_to_world applied to world gravity [0, 0, gravity].
+    cos_p = math.cos(pitch)
+    sin_p = math.sin(pitch)
+    cos_r = math.cos(roll)
+    sin_r = math.sin(roll)
+    cos_y = math.cos(yaw)
+    sin_y = math.sin(yaw)
+
+    r13 = cos_y * sin_p * cos_r + sin_y * sin_r
+    r23 = sin_y * sin_p * cos_r - cos_y * sin_r
+    r33 = cos_p * cos_r
+    return [r13 * gravity, r23 * gravity, r33 * gravity]
 
 
 class SensorState:
@@ -118,9 +163,23 @@ class SensorState:
         self.yaw = 0.0
         self.pos_offset = [0.0, 0.0, 0.0]
         self.rot_offset = [0.0, 0.0, 0.0]
-        self.gravity_mag = 9.80665
+        self.gravity_mag = -9.86
         self.deadband = 0.15
-        self.damping = 0.95
+        self.gyro_deadband = 0.0
+        self.damping = 0.995
+        self.alpha = None
+        self.subtract_gravity = None
+        self.position_scale = None
+        self.accel_gain = None
+        self.accel_dt_scale = None
+        self.accel_position_mix = 0.0
+        self.zupt_enabled = True
+        self.zupt_accel_threshold = 0.35
+        self.zupt_gyro_threshold = 0.08
+        self.cane_contact_accel_threshold = 0.80
+        self.cane_length = 0.90
+        self.sensor_position_from_tip = 0.20
+        self.sensor_to_tip = None
         self.mode_override = None
 
     def reset(self):
@@ -860,34 +919,113 @@ def sensor_apply_data(
     state = _sensor_states[sensor_name]
 
     active_mode = normalize_sensor_mode(state.mode_override if state.mode_override is not None else mode)
+    active_alpha = state.alpha if state.alpha is not None else alpha
+    active_subtract_gravity = state.subtract_gravity if state.subtract_gravity is not None else subtract_gravity
+    active_position_scale = state.position_scale if state.position_scale is not None else position_scale
+    active_accel_gain = state.accel_gain if state.accel_gain is not None else 1.0
+    active_accel_dt = dt * (state.accel_dt_scale if state.accel_dt_scale is not None else 1.0)
+    active_accel_position_mix = state.accel_position_mix
+    sensor_to_tip = state.sensor_to_tip
+    if not sensor_to_tip or vector_norm(sensor_to_tip) == 0:
+        sensor_to_tip_distance = min(state.sensor_position_from_tip, state.cane_length) if state.cane_length > 0 else state.sensor_position_from_tip
+        sensor_to_tip = [sensor_to_tip_distance, 0.0, 0.0]
 
     if active_mode == "raw":
         location = accel
         rotation = gyro
     elif active_mode == "integrate":
+        gyro = [0.0 if abs(g) < state.gyro_deadband else g for g in gyro]
         ax, ay, az = accel
-        if subtract_gravity:
-            az -= state.gravity_mag
+        if active_subtract_gravity:
+            gravity_body = gravity_in_body_frame(state.gravity_mag, state.pitch, state.roll, state.yaw)
+            ax -= gravity_body[0]
+            ay -= gravity_body[1]
+            az -= gravity_body[2]
 
         # Apply deadband threshold
         if abs(ax) < state.deadband: ax = 0.0
         if abs(ay) < state.deadband: ay = 0.0
         if abs(az) < state.deadband: az = 0.0
+        ax *= active_accel_gain
+        ay *= active_accel_gain
+        az *= active_accel_gain
 
-        # Integrate velocity with damping to prevent drift
-        state.velocity[0] = (state.velocity[0] + ax * dt) * state.damping
-        state.velocity[1] = (state.velocity[1] + ay * dt) * state.damping
-        state.velocity[2] = (state.velocity[2] + az * dt) * state.damping
+        # Basic double integration:
+        # velocity = velocity + acceleration * delta_time
+        # distance = distance + velocity * delta_time
+        state.velocity[0] += ax * active_accel_dt
+        state.velocity[1] += ay * active_accel_dt
+        state.velocity[2] += az * active_accel_dt
 
-        # Integrate position
-        state.position[0] += state.velocity[0] * dt
-        state.position[1] += state.velocity[1] * dt
-        state.position[2] += state.velocity[2] * dt
+        state.position[0] += state.velocity[0] * active_accel_dt
+        state.position[1] += state.velocity[1] * active_accel_dt
+        state.position[2] += state.velocity[2] * active_accel_dt
+
+        # Apply gentle drag after position update to reduce long-term drift.
+        state.velocity[0] *= state.damping
+        state.velocity[1] *= state.damping
+        state.velocity[2] *= state.damping
 
         # Integrate gyro → angle
         state.pitch += gyro[0] * dt
         state.roll += gyro[1] * dt
         state.yaw += gyro[2] * dt
+
+        location = list(state.position)
+        rotation = [state.pitch, state.roll, state.yaw]
+    elif active_mode == "cane":
+        ax, ay, az = accel
+        gyro = [0.0 if abs(g) < state.gyro_deadband else g for g in gyro]
+        gx, gy, gz = gyro
+
+        # Keep cane rotation identical to double-integrate mode: gyro only.
+        state.pitch += gx * dt
+        state.roll += gy * dt
+        state.yaw += gz * dt
+
+        accel_norm = vector_norm(accel)
+        gyro_norm = vector_norm(gyro)
+        near_gravity = abs(accel_norm - abs(state.gravity_mag))
+        zero_velocity = (
+            state.zupt_enabled
+            and near_gravity <= state.zupt_accel_threshold
+            and gyro_norm <= state.zupt_gyro_threshold
+        )
+        ground_contact = near_gravity <= state.cane_contact_accel_threshold
+
+        if active_subtract_gravity:
+            gravity_body = gravity_in_body_frame(state.gravity_mag, state.pitch, state.roll, state.yaw)
+            accel_for_position = [ax - gravity_body[0], ay - gravity_body[1], az - gravity_body[2]]
+        else:
+            accel_for_position = [ax, ay, az]
+        for i in range(3):
+            if abs(accel_for_position[i]) < state.deadband:
+                accel_for_position[i] = 0.0
+            accel_for_position[i] *= active_accel_gain
+
+        if zero_velocity:
+            state.velocity = [0.0, 0.0, 0.0]
+        elif ground_contact:
+            # Inverted pendulum model while the cane tip is planted:
+            # sensor velocity ~= sensor_to_tip_body x gyro_body.
+            # Keep this in sensor/local axes so rotation stays as stable as double-integrate.
+            state.velocity = cross(sensor_to_tip, gyro)
+        else:
+            for i in range(3):
+                state.velocity[i] += accel_for_position[i] * active_accel_dt
+
+        state.position[0] += state.velocity[0] * active_accel_dt
+        state.position[1] += state.velocity[1] * active_accel_dt
+        state.position[2] += state.velocity[2] * active_accel_dt
+
+        if active_accel_position_mix > 0.0:
+            state.position[0] += accel_for_position[0] * active_accel_position_mix * active_accel_dt
+            state.position[1] += accel_for_position[1] * active_accel_position_mix * active_accel_dt
+            state.position[2] += accel_for_position[2] * active_accel_position_mix * active_accel_dt
+
+        state.velocity[0] *= state.damping
+        state.velocity[1] *= state.damping
+        state.velocity[2] *= state.damping
 
         location = list(state.position)
         rotation = [state.pitch, state.roll, state.yaw]
@@ -900,8 +1038,8 @@ def sensor_apply_data(
         accel_roll = math.atan2(-ax, az)
 
         # Complementary filter
-        state.pitch = alpha * (state.pitch + gx * dt) + (1.0 - alpha) * accel_pitch
-        state.roll = alpha * (state.roll + gy * dt) + (1.0 - alpha) * accel_roll
+        state.pitch = active_alpha * (state.pitch + gx * dt) + (1.0 - active_alpha) * accel_pitch
+        state.roll = active_alpha * (state.roll + gy * dt) + (1.0 - active_alpha) * accel_roll
 
         if mag:
             mx, my, mz = mag
@@ -912,7 +1050,7 @@ def sensor_apply_data(
             mx_comp = mx * cos_p + mz * sin_p
             my_comp = mx * sin_r * sin_p + my * cos_r - mz * sin_r * cos_p
             mag_yaw = math.atan2(-my_comp, mx_comp)
-            state.yaw = alpha * (state.yaw + gz * dt) + (1.0 - alpha) * mag_yaw
+            state.yaw = active_alpha * (state.yaw + gz * dt) + (1.0 - active_alpha) * mag_yaw
         else:
             state.yaw += gz * dt
 
@@ -928,27 +1066,33 @@ def sensor_apply_data(
         ay_w = (sin_y * cos_p) * ax + (sin_y * sin_p * sin_r + cos_y * cos_r) * ay + (sin_y * sin_p * cos_r - cos_y * sin_r) * az
         az_w = (-sin_p) * ax + (cos_p * sin_r) * ay + (cos_p * cos_r) * az
 
-        if subtract_gravity:
+        if active_subtract_gravity:
             az_w -= state.gravity_mag
 
         # Apply deadband threshold
         if abs(ax_w) < state.deadband: ax_w = 0.0
         if abs(ay_w) < state.deadband: ay_w = 0.0
         if abs(az_w) < state.deadband: az_w = 0.0
+        ax_w *= active_accel_gain
+        ay_w *= active_accel_gain
+        az_w *= active_accel_gain
 
-        # Integrate velocity with damping to prevent drift
-        state.velocity[0] = (state.velocity[0] + ax_w * dt) * state.damping
-        state.velocity[1] = (state.velocity[1] + ay_w * dt) * state.damping
-        state.velocity[2] = (state.velocity[2] + az_w * dt) * state.damping
+        state.velocity[0] += ax_w * active_accel_dt
+        state.velocity[1] += ay_w * active_accel_dt
+        state.velocity[2] += az_w * active_accel_dt
 
-        state.position[0] += state.velocity[0] * dt
-        state.position[1] += state.velocity[1] * dt
-        state.position[2] += state.velocity[2] * dt
+        state.position[0] += state.velocity[0] * active_accel_dt
+        state.position[1] += state.velocity[1] * active_accel_dt
+        state.position[2] += state.velocity[2] * active_accel_dt
+
+        state.velocity[0] *= state.damping
+        state.velocity[1] *= state.damping
+        state.velocity[2] *= state.damping
 
         location = list(state.position)
         rotation = [state.pitch, state.roll, state.yaw]
     else:
-        return {"error": f"Unknown mode '{active_mode}'. Use 'raw', 'double-integrate', or 'mix'."}
+        return {"error": f"Unknown mode '{active_mode}'. Use 'raw', 'double-integrate', 'mix', or 'cane'."}
 
     # Apply offset calibrations
     calibrated_location = [location[i] - state.pos_offset[i] for i in range(3)]
@@ -964,7 +1108,7 @@ def sensor_apply_data(
         "location": calibrated_location,
         "rotation": calibrated_rotation,
         "insert_keyframe": insert_keyframe,
-        "position_scale": position_scale,
+        "position_scale": active_position_scale,
     }
     if frame is not None:
         params["frame"] = frame
@@ -977,8 +1121,36 @@ def sensor_apply_data(
             state.gravity_mag = res["gravity"]
         if "deadband" in res:
             state.deadband = res["deadband"]
+        if "gyro_deadband" in res:
+            state.gyro_deadband = res["gyro_deadband"]
         if "damping" in res:
             state.damping = res["damping"]
+        if "alpha" in res:
+            state.alpha = res["alpha"]
+        if "subtract_gravity" in res:
+            state.subtract_gravity = res["subtract_gravity"]
+        if "position_scale" in res:
+            state.position_scale = res["position_scale"]
+        if "accel_gain" in res:
+            state.accel_gain = res["accel_gain"]
+        if "accel_dt_scale" in res:
+            state.accel_dt_scale = res["accel_dt_scale"]
+        if "accel_position_mix" in res:
+            state.accel_position_mix = res["accel_position_mix"]
+        if "zupt_enabled" in res:
+            state.zupt_enabled = res["zupt_enabled"]
+        if "zupt_accel_threshold" in res:
+            state.zupt_accel_threshold = res["zupt_accel_threshold"]
+        if "zupt_gyro_threshold" in res:
+            state.zupt_gyro_threshold = res["zupt_gyro_threshold"]
+        if "cane_contact_accel_threshold" in res:
+            state.cane_contact_accel_threshold = res["cane_contact_accel_threshold"]
+        if "cane_length" in res:
+            state.cane_length = res["cane_length"]
+        if "sensor_position_from_tip" in res:
+            state.sensor_position_from_tip = res["sensor_position_from_tip"]
+        if "sensor_to_tip" in res:
+            state.sensor_to_tip = res["sensor_to_tip"]
         if "mode" in res:
             state.mode_override = res["mode"]
 

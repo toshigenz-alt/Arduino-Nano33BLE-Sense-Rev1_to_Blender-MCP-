@@ -21,6 +21,7 @@ void setup() {
     // Wait up to 3 seconds for serial console to open
   }
   Serial.println("[Arduino] Test Sender initialized. Sending dummy sine-wave data...");
+  Serial.println("DATA_HEADER,ax_mps,ay_mps,az_mps,gx_rad,gy_rad,gz_rad,mx_uT,my_uT,mz_uT,r,g,b,amb,press_hpa");
   lastSendTime = millis();
 }
 
@@ -61,6 +62,7 @@ void loop() {
     float pressure_hpa = 1013.25 + sin(t) * 10.0;
 
     // CSV Output
+    Serial.print("DATA,");
     Serial.print(ax_mps, 4); Serial.print(",");
     Serial.print(ay_mps, 4); Serial.print(",");
     Serial.print(az_mps, 4); Serial.print(",");

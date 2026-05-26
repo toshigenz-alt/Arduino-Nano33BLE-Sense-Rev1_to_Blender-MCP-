@@ -568,8 +568,9 @@ def handle_sensor_apply_data(params):
     location = params.get("location", [0, 0, 0])
     rotation = params.get("rotation", [0, 0, 0])
     frame = params.get("frame", bpy.context.scene.frame_current)
-    insert_keyframe = params.get("insert_keyframe", True)
-    position_scale = params.get("position_scale", 1.0)
+    scene = bpy.context.scene
+    insert_keyframe = getattr(scene, "mcp_record_keyframes", params.get("insert_keyframe", True))
+    position_scale = getattr(scene, "mcp_position_scale", params.get("position_scale", 1.0))
 
     obj.location = (location[0] * position_scale, location[1] * position_scale, location[2] * position_scale)
     obj.rotation_euler = rotation
@@ -579,7 +580,6 @@ def handle_sensor_apply_data(params):
         obj.keyframe_insert(data_path="rotation_euler", frame=frame)
 
     # Read and clear reset/init flags requested from UI
-    scene = bpy.context.scene
     reset_requested = getattr(scene, "mcp_reset_requested", False)
     init_requested = getattr(scene, "mcp_init_requested", False)
 
@@ -593,9 +593,24 @@ def handle_sensor_apply_data(params):
         "frame": frame,
         "location": list(obj.location),
         "rotation": list(obj.rotation_euler),
-        "gravity": getattr(scene, "mcp_gravity", 9.80665),
+        "gravity": getattr(scene, "mcp_gravity", -9.86),
         "deadband": getattr(scene, "mcp_deadband", 0.15),
-        "damping": getattr(scene, "mcp_damping", 0.95),
+        "gyro_deadband": getattr(scene, "mcp_gyro_deadband", 0.0),
+        "damping": getattr(scene, "mcp_damping", 0.995),
+        "alpha": getattr(scene, "mcp_alpha", 0.98),
+        "subtract_gravity": getattr(scene, "mcp_subtract_gravity", True),
+        "position_scale": getattr(scene, "mcp_position_scale", 1.0),
+        "accel_gain": getattr(scene, "mcp_accel_gain", 1.0),
+        "accel_dt_scale": getattr(scene, "mcp_accel_dt_scale", 1.0),
+        "accel_position_mix": getattr(scene, "mcp_accel_position_mix", 0.0),
+        "zupt_enabled": getattr(scene, "mcp_zupt_enabled", True),
+        "zupt_accel_threshold": getattr(scene, "mcp_zupt_accel_threshold", 0.35),
+        "zupt_gyro_threshold": getattr(scene, "mcp_zupt_gyro_threshold", 0.08),
+        "cane_contact_accel_threshold": getattr(scene, "mcp_cane_contact_accel_threshold", 0.80),
+        "cane_length": getattr(scene, "mcp_cane_length", 0.90),
+        "sensor_position_from_tip": getattr(scene, "mcp_sensor_position_from_tip", 0.20),
+        "sensor_to_tip": list(getattr(scene, "mcp_sensor_to_tip", (0.0, 0.0, 0.0))),
+        "record_keyframes": getattr(scene, "mcp_record_keyframes", False),
         "mode": getattr(scene, "mcp_sensor_mode", "mix"),
     }
     if reset_requested:
@@ -945,9 +960,28 @@ class MCP_PT_Panel(bpy.types.Panel):
             # Calibration parameters
             col = ctrl_box.column(align=True)
             col.prop(scene, "mcp_sensor_mode", text="Mode")
+            col.prop(scene, "mcp_alpha", text="Mix Alpha")
             col.prop(scene, "mcp_gravity", text="Gravity (m/s²)")
+            col.prop(scene, "mcp_subtract_gravity", text="Subtract Gravity")
             col.prop(scene, "mcp_deadband", text="Deadband Threshold")
+            col.prop(scene, "mcp_gyro_deadband", text="Gyro Deadband")
+            col.prop(scene, "mcp_accel_gain", text="Accel Gain")
+            col.prop(scene, "mcp_accel_dt_scale", text="Accel DT Scale")
+            col.prop(scene, "mcp_accel_position_mix", text="Accel Position Mix")
             col.prop(scene, "mcp_damping", text="Velocity Damping")
+            col.prop(scene, "mcp_position_scale", text="Position Scale")
+            col.prop(scene, "mcp_record_keyframes", text="Record Keyframes")
+
+            cane_box = ctrl_box.box()
+            cane_box.label(text="Cane Model", icon='IPO_EASE_IN_OUT')
+            cane_col = cane_box.column(align=True)
+            cane_col.prop(scene, "mcp_zupt_enabled", text="ZUPT Enabled")
+            cane_col.prop(scene, "mcp_zupt_accel_threshold", text="ZUPT Accel Threshold")
+            cane_col.prop(scene, "mcp_zupt_gyro_threshold", text="ZUPT Gyro Threshold")
+            cane_col.prop(scene, "mcp_cane_contact_accel_threshold", text="Contact Accel Threshold")
+            cane_col.prop(scene, "mcp_cane_length", text="Cane Length (m)")
+            cane_col.prop(scene, "mcp_sensor_position_from_tip", text="Sensor From Tip (m)")
+            cane_col.prop(scene, "mcp_sensor_to_tip", text="Sensor To Tip Vector")
             
             layout.separator()
             row = ctrl_box.row(align=True)
@@ -1004,8 +1038,20 @@ def register():
     )
     bpy.types.Scene.mcp_gravity = bpy.props.FloatProperty(
         name="Gravity Magnitude",
-        default=9.80665,
-        description="Gravity constant value to subtract from Z axis (m/s²)"
+        default=-9.86,
+        description="Signed gravity value in m/s². Use the sign that makes the stationary sensor stop drifting"
+    )
+    bpy.types.Scene.mcp_subtract_gravity = bpy.props.BoolProperty(
+        name="Subtract Gravity",
+        default=True,
+        description="Subtract gravity from acceleration before integration"
+    )
+    bpy.types.Scene.mcp_alpha = bpy.props.FloatProperty(
+        name="Mix Alpha",
+        default=0.98,
+        min=0.0,
+        max=1.0,
+        description="Complementary filter weight. Higher values trust gyro more, lower values trust accel/mag more"
     )
     bpy.types.Scene.mcp_deadband = bpy.props.FloatProperty(
         name="Accel Deadband",
@@ -1014,19 +1060,97 @@ def register():
         max=2.0,
         description="Noise threshold below which acceleration is zeroed out to prevent drift"
     )
+    bpy.types.Scene.mcp_gyro_deadband = bpy.props.FloatProperty(
+        name="Gyro Deadband",
+        default=0.0,
+        min=0.0,
+        description="Noise threshold below which gyro angular velocity is zeroed before integrating rotation"
+    )
     bpy.types.Scene.mcp_damping = bpy.props.FloatProperty(
         name="Vel Damping",
-        default=0.95,
+        default=0.995,
         min=0.0,
         max=1.0,
-        description="Velocity damping factor per frame to decay drift speed"
+        description="Velocity damping factor per sample. Use values near 1.0 for visible double-integration movement"
+    )
+    bpy.types.Scene.mcp_accel_gain = bpy.props.FloatProperty(
+        name="Accel Gain",
+        default=1.0,
+        min=0.0,
+        description="Multiplier applied to acceleration before position integration"
+    )
+    bpy.types.Scene.mcp_accel_dt_scale = bpy.props.FloatProperty(
+        name="Accel DT Scale",
+        default=1.0,
+        min=0.0,
+        description="Multiplier applied only to acceleration integration delta time. Gyro delta time is unchanged"
+    )
+    bpy.types.Scene.mcp_accel_position_mix = bpy.props.FloatProperty(
+        name="Accel Position Mix",
+        default=0.0,
+        min=0.0,
+        description="Adds a raw acceleration-to-position component so movement is visible while tuning cane/double integration"
+    )
+    bpy.types.Scene.mcp_position_scale = bpy.props.FloatProperty(
+        name="Position Scale",
+        default=1.0,
+        min=0.0,
+        description="Multiplier applied to sensor-driven location in Blender"
+    )
+    bpy.types.Scene.mcp_record_keyframes = bpy.props.BoolProperty(
+        name="Record Keyframes",
+        default=False,
+        description="Insert location and rotation keyframes while streaming"
+    )
+    bpy.types.Scene.mcp_zupt_enabled = bpy.props.BoolProperty(
+        name="ZUPT Enabled",
+        default=True,
+        description="Reset velocity to zero when acceleration is near gravity and gyro is near zero"
+    )
+    bpy.types.Scene.mcp_zupt_accel_threshold = bpy.props.FloatProperty(
+        name="ZUPT Accel Threshold",
+        default=0.35,
+        min=0.0,
+        description="Allowed difference between acceleration norm and gravity for zero-velocity detection"
+    )
+    bpy.types.Scene.mcp_zupt_gyro_threshold = bpy.props.FloatProperty(
+        name="ZUPT Gyro Threshold",
+        default=0.08,
+        min=0.0,
+        description="Maximum gyro norm in rad/s for zero-velocity detection"
+    )
+    bpy.types.Scene.mcp_cane_contact_accel_threshold = bpy.props.FloatProperty(
+        name="Contact Accel Threshold",
+        default=0.80,
+        min=0.0,
+        description="Allowed acceleration-norm difference from gravity for cane ground-contact detection"
+    )
+    bpy.types.Scene.mcp_cane_length = bpy.props.FloatProperty(
+        name="Cane Length",
+        default=0.90,
+        min=0.0,
+        description="Total cane length from tip to handle in metres; used as geometry reference"
+    )
+    bpy.types.Scene.mcp_sensor_position_from_tip = bpy.props.FloatProperty(
+        name="Sensor Position From Tip",
+        default=0.20,
+        min=0.0,
+        description="Distance from cane tip to the IMU sensor in metres"
+    )
+    bpy.types.Scene.mcp_sensor_to_tip = bpy.props.FloatVectorProperty(
+        name="Sensor To Tip Vector",
+        default=(0.0, 0.0, 0.0),
+        size=3,
+        subtype='XYZ',
+        description="Vector from IMU sensor to cane tip in the sensor/body coordinate frame, in metres. Leave zero to use Sensor Position From Tip on local +X"
     )
     bpy.types.Scene.mcp_sensor_mode = bpy.props.EnumProperty(
         name="Processing Mode",
         items=[
             ('raw', 'Raw', 'Direct sensor mapping'),
             ('double-integrate', 'Double-Integrate', 'Double-integrate accel to position, single-integrate gyro to rotation'),
-            ('mix', 'Mix', 'Complementary accel/gyro/mag mix for rotation, world-frame double-integration for position')
+            ('mix', 'Mix', 'Complementary accel/gyro/mag mix for rotation, world-frame double-integration for position'),
+            ('cane', 'Cane', 'Walking-cane model with ZUPT and inverted-pendulum velocity updates')
         ],
         default='mix',
         description="Sensor processing mode"
@@ -1045,8 +1169,23 @@ def unregister():
     del bpy.types.Scene.mcp_reset_requested
     del bpy.types.Scene.mcp_init_requested
     del bpy.types.Scene.mcp_gravity
+    del bpy.types.Scene.mcp_subtract_gravity
+    del bpy.types.Scene.mcp_alpha
     del bpy.types.Scene.mcp_deadband
+    del bpy.types.Scene.mcp_gyro_deadband
     del bpy.types.Scene.mcp_damping
+    del bpy.types.Scene.mcp_accel_gain
+    del bpy.types.Scene.mcp_accel_dt_scale
+    del bpy.types.Scene.mcp_accel_position_mix
+    del bpy.types.Scene.mcp_position_scale
+    del bpy.types.Scene.mcp_record_keyframes
+    del bpy.types.Scene.mcp_zupt_enabled
+    del bpy.types.Scene.mcp_zupt_accel_threshold
+    del bpy.types.Scene.mcp_zupt_gyro_threshold
+    del bpy.types.Scene.mcp_cane_contact_accel_threshold
+    del bpy.types.Scene.mcp_cane_length
+    del bpy.types.Scene.mcp_sensor_position_from_tip
+    del bpy.types.Scene.mcp_sensor_to_tip
     del bpy.types.Scene.mcp_sensor_mode
 
 

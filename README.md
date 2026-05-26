@@ -237,6 +237,7 @@ bridge จะสแกน port ให้เลือก
 | `raw` | map accel เป็น location และ gyro เป็น rotation ตรง ๆ | debug ว่า sensor มีค่าเปลี่ยนไหม |
 | `double-integrate` | integrate gyro เป็น rotation และ double-integrate accel เป็น position | movement สั้น ๆ, ทดลอง position จาก acceleration |
 | `mix` | ใช้ complementary filter ผสม accel/gyro/mag สำหรับ rotation แล้ว integrate position ใน world frame | ใช้งานจริง แนะนำเริ่มที่ mode นี้ |
+| `cane` | ใช้ ZUPT และโมเดล inverted pendulum สำหรับไม้เท้า | ทดลอง walking cane / sensor ติดบนด้ามไม้เท้า |
 
 ชื่อเก่ายังใช้ได้เพื่อ backward compatibility:
 
@@ -251,10 +252,23 @@ fusion    -> mix
 
 | Control | มีผลกับ mode | คำอธิบาย |
 |---|---|---|
-| `Mode` | ทุก mode | เลือก `raw`, `double-integrate`, `mix` |
-| `Gravity` | `double-integrate`, `mix` | ค่า gravity ที่หักออกจาก acceleration ค่าเริ่มต้น `9.80665` |
-| `Deadband Threshold` | `double-integrate`, `mix` | ตัด noise ของ acceleration ค่าน้อยไวกว่า แต่ drift ง่าย |
-| `Velocity Damping` | `double-integrate`, `mix` | ลดความเร็วสะสมเพื่อกัน drift ค่า `1.0` ไม่หน่วง, ค่าเล็กลงหยุดไวขึ้น |
+| `Mode` | ทุก mode | เลือก `raw`, `double-integrate`, `mix`, `cane` |
+| `Mix Alpha` | `mix`, `cane` | น้ำหนัก complementary filter ค่าใกล้ `1.0` เชื่อ gyro มากขึ้น ค่าใกล้ `0.0` เชื่อ accel/mag มากขึ้น |
+| `Gravity` | `double-integrate`, `mix`, `cane` | ค่า gravity ที่หักออกจาก acceleration ค่าเริ่มต้น `9.80665` |
+| `Subtract Gravity` | `double-integrate`, `mix`, `cane` | เปิด/ปิดการหัก gravity ก่อน integrate |
+| `Deadband Threshold` | `double-integrate`, `mix`, `cane` | ตัด noise ของ acceleration ค่าน้อยไวกว่า แต่ drift ง่าย |
+| `Accel Gain` | `double-integrate`, `mix`, `cane` | คูณ acceleration ก่อน integrate |
+| `Accel DT Scale` | `double-integrate`, `mix`, `cane` | คูณเฉพาะ delta time ฝั่ง accel ไม่กระทบ gyro |
+| `Velocity Damping` | `double-integrate`, `mix`, `cane` | ลดความเร็วสะสมเพื่อกัน drift ค่า `1.0` ไม่หน่วง, ค่าเล็กลงหยุดไวขึ้น |
+| `Position Scale` | ทุก mode | ตัวคูณ location ที่ส่งเข้า Blender |
+| `Record Keyframes` | ทุก mode | insert keyframe ระหว่าง streaming |
+| `ZUPT Enabled` | `cane` | reset velocity เป็น 0 เมื่อ IMU ดูนิ่ง |
+| `ZUPT Accel Threshold` | `cane` | ความต่างที่ยอมให้ accel norm ใกล้ gravity เพื่อถือว่านิ่ง |
+| `ZUPT Gyro Threshold` | `cane` | gyro norm สูงสุดเพื่อถือว่านิ่ง |
+| `Contact Accel Threshold` | `cane` | ใช้แยกช่วงปลายไม้แตะพื้น แต่ด้ามยังหมุน |
+| `Cane Length` | `cane` | ความยาวไม้เท้าทั้งอัน เป็น geometry reference |
+| `Sensor From Tip` | `cane` | ระยะจากปลายไม้ถึง sensor |
+| `Sensor To Tip Vector` | `cane` | vector จาก sensor ไปปลายไม้ในแกน local ของ sensor หน่วยเมตร |
 | `Set Init` | ทุก mode | ตั้งตำแหน่ง/มุมปัจจุบันเป็น zero reference |
 | `Reset State` | ทุก mode | reset velocity, position และ rotation state |
 
@@ -262,9 +276,13 @@ fusion    -> mix
 
 ```text
 Mode: mix
+Mix Alpha: 0.98
 Gravity: 9.80665
+Subtract Gravity: on
 Deadband Threshold: 0.20
-Velocity Damping: 0.92
+Velocity Damping: 0.995
+Position Scale: 1.0
+Record Keyframes: off
 ```
 
 ค่าพวกนี้เปลี่ยนระหว่างรันได้ bridge จะรับค่ากลับจาก Blender แล้วมีผลกับ sample ถัดไป

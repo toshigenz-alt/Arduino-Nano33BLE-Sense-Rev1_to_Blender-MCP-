@@ -37,8 +37,14 @@ def list_serial_ports():
     return [port.device for port in ports]
 
 def parse_csv_line(line):
-    # Expected format: ax,ay,az,gx,gy,gz,mx,my,mz,r,g,b,amb,press
+    # Expected format:
+    #   ax,ay,az,gx,gy,gz,mx,my,mz,r,g,b,amb,press
+    #   DATA,ax,ay,az,gx,gy,gz,mx,my,mz,r,g,b,amb,press
     parts = line.strip().split(',')
+    if parts and parts[0] == "DATA_HEADER":
+        return None
+    if parts and parts[0] == "DATA":
+        parts = parts[1:]
     if len(parts) < 6:
         return None
     try:
@@ -97,6 +103,7 @@ def parse_json_line(line):
 # Global queue for latency buffering
 data_queue = deque()
 running = True
+last_bad_line_log = 0.0
 
 def send_to_blender(packet, args, dt):
     # Apply sensor data
@@ -213,9 +220,9 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["raw", "double-integrate", "mix", "integrate", "fusion"],
+        choices=["raw", "double-integrate", "mix", "cane", "integrate", "fusion"],
         default="mix",
-        help="Processing mode: raw, double-integrate, or mix (default: mix)",
+        help="Processing mode: raw, double-integrate, mix, or cane (default: mix)",
     )
     parser.add_argument("--alpha", type=float, default=0.98, help="Complementary filter alpha (default: 0.98)")
     parser.add_argument("--latency", type=int, default=0, help="Latency compensation delay in milliseconds (default: 0)")
@@ -310,8 +317,14 @@ def main():
 
             if not packet:
                 # Debug print for non-matching lines (e.g. Arduino logs or startup prints)
+                global last_bad_line_log
+                now = time.time()
                 if not line.startswith('{') and ',' not in line:
                     print(f"\n[Arduino Log] {line}")
+                elif now - last_bad_line_log >= 1.0:
+                    last_bad_line_log = now
+                    comma_count = line.count(',')
+                    print(f"\n[Bad Serial Line] commas={comma_count} raw={line[:180]}")
                 continue
 
             # Push packet into latency buffer queue
