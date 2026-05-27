@@ -27,6 +27,7 @@ import os
 import tempfile
 import math
 import struct
+import re
 from mathutils import Vector, Euler, Matrix
 
 
@@ -41,6 +42,196 @@ _command_queue = []
 _result_map = {}
 _lock = threading.Lock()
 _command_id = 0
+_replay_points = []
+_replay_index = 0
+_replay_running = False
+_replay_timer_registered = False
+
+SENSOR_PRESET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sensor_presets.json")
+
+BUILTIN_SENSOR_PRESETS = {
+    "stable_rotation": {
+        "mode": "double-integrate",
+        "gravity": -9.86,
+        "subtract_gravity": True,
+        "deadband": 0.15,
+        "gyro_deadband": 0.01,
+        "accel_gain": 1.0,
+        "accel_dt_scale": 1.0,
+        "accel_position_mix": 0.0,
+        "velocity_damping": 0.995,
+        "position_scale": 1.0,
+        "axis_map_x": "x",
+        "axis_map_y": "y",
+        "axis_map_z": "z",
+        "axis_sign_x": 1.0,
+        "axis_sign_y": 1.0,
+        "axis_sign_z": 1.0,
+        "zupt_enabled": True,
+        "zupt_accel_threshold": 0.35,
+        "zupt_gyro_threshold": 0.08,
+        "cane_contact_accel_threshold": 0.80,
+        "cane_length": 0.90,
+        "sensor_position_from_tip": 0.20,
+        "sensor_to_tip": [0.0, 0.0, 0.0],
+    }
+}
+
+
+def load_sensor_presets():
+    presets = dict(BUILTIN_SENSOR_PRESETS)
+    try:
+        with open(SENSOR_PRESET_FILE, "r", encoding="utf-8") as preset_file:
+            saved = json.load(preset_file)
+        if isinstance(saved, dict):
+            presets.update(saved)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        print(f"[MCP] Failed to load sensor presets: {exc}")
+    return presets
+
+
+def save_sensor_presets(presets):
+    with open(SENSOR_PRESET_FILE, "w", encoding="utf-8") as preset_file:
+        json.dump(presets, preset_file, indent=2, sort_keys=True)
+        preset_file.write("\n")
+
+
+def sensor_preset_name(scene):
+    name = getattr(scene, "mcp_sensor_preset_name", "stable_rotation").strip()
+    return name or "stable_rotation"
+
+
+def capture_sensor_settings(scene):
+    return {
+        "mode": getattr(scene, "mcp_sensor_mode", "double-integrate"),
+        "gravity": getattr(scene, "mcp_gravity", -9.86),
+        "subtract_gravity": getattr(scene, "mcp_subtract_gravity", True),
+        "deadband": getattr(scene, "mcp_deadband", 0.15),
+        "gyro_deadband": getattr(scene, "mcp_gyro_deadband", 0.01),
+        "accel_gain": getattr(scene, "mcp_accel_gain", 1.0),
+        "accel_dt_scale": getattr(scene, "mcp_accel_dt_scale", 1.0),
+        "accel_position_mix": getattr(scene, "mcp_accel_position_mix", 0.0),
+        "velocity_damping": getattr(scene, "mcp_damping", 0.995),
+        "position_scale": getattr(scene, "mcp_position_scale", 1.0),
+        "axis_map_x": getattr(scene, "mcp_axis_map_x", "x"),
+        "axis_map_y": getattr(scene, "mcp_axis_map_y", "y"),
+        "axis_map_z": getattr(scene, "mcp_axis_map_z", "z"),
+        "axis_sign_x": getattr(scene, "mcp_axis_sign_x", 1.0),
+        "axis_sign_y": getattr(scene, "mcp_axis_sign_y", 1.0),
+        "axis_sign_z": getattr(scene, "mcp_axis_sign_z", 1.0),
+        "zupt_enabled": getattr(scene, "mcp_zupt_enabled", True),
+        "zupt_accel_threshold": getattr(scene, "mcp_zupt_accel_threshold", 0.35),
+        "zupt_gyro_threshold": getattr(scene, "mcp_zupt_gyro_threshold", 0.08),
+        "cane_contact_accel_threshold": getattr(scene, "mcp_cane_contact_accel_threshold", 0.80),
+        "cane_length": getattr(scene, "mcp_cane_length", 0.90),
+        "sensor_position_from_tip": getattr(scene, "mcp_sensor_position_from_tip", 0.20),
+        "sensor_to_tip": list(getattr(scene, "mcp_sensor_to_tip", (0.0, 0.0, 0.0))),
+    }
+
+
+def apply_sensor_settings(scene, settings):
+    scene.mcp_sensor_mode = settings.get("mode", "double-integrate")
+    scene.mcp_gravity = settings.get("gravity", -9.86)
+    scene.mcp_subtract_gravity = settings.get("subtract_gravity", True)
+    scene.mcp_deadband = settings.get("deadband", 0.15)
+    scene.mcp_gyro_deadband = settings.get("gyro_deadband", 0.01)
+    scene.mcp_accel_gain = settings.get("accel_gain", 1.0)
+    scene.mcp_accel_dt_scale = settings.get("accel_dt_scale", 1.0)
+    scene.mcp_accel_position_mix = settings.get("accel_position_mix", 0.0)
+    scene.mcp_damping = settings.get("velocity_damping", 0.995)
+    scene.mcp_position_scale = settings.get("position_scale", 1.0)
+    scene.mcp_axis_map_x = settings.get("axis_map_x", "x")
+    scene.mcp_axis_map_y = settings.get("axis_map_y", "y")
+    scene.mcp_axis_map_z = settings.get("axis_map_z", "z")
+    scene.mcp_axis_sign_x = settings.get("axis_sign_x", 1.0)
+    scene.mcp_axis_sign_y = settings.get("axis_sign_y", 1.0)
+    scene.mcp_axis_sign_z = settings.get("axis_sign_z", 1.0)
+    scene.mcp_zupt_enabled = settings.get("zupt_enabled", True)
+    scene.mcp_zupt_accel_threshold = settings.get("zupt_accel_threshold", 0.35)
+    scene.mcp_zupt_gyro_threshold = settings.get("zupt_gyro_threshold", 0.08)
+    scene.mcp_cane_contact_accel_threshold = settings.get("cane_contact_accel_threshold", 0.80)
+    scene.mcp_cane_length = settings.get("cane_length", 0.90)
+    scene.mcp_sensor_position_from_tip = settings.get("sensor_position_from_tip", 0.20)
+    scene.mcp_sensor_to_tip = settings.get("sensor_to_tip", [0.0, 0.0, 0.0])
+
+
+def parse_replay_transform_log(file_path):
+    """Parse bridge terminal logs containing Pos/Rot status lines."""
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as log_file:
+        text = log_file.read()
+
+    points = []
+    last_rotation = [0.0, 0.0, 0.0]
+    chunks = text.split("[Active]")
+    for chunk in chunks:
+        pos_match = re.search(r"Pos:\s*\[([^\]]+)\]", chunk)
+        if not pos_match:
+            continue
+
+        pos_values = [float(v) for v in re.findall(r"[-+]?\d+(?:\.\d+)?", pos_match.group(1))]
+        if len(pos_values) < 3:
+            continue
+
+        rotation = list(last_rotation)
+        rot_index = chunk.find("Rot:")
+        if rot_index >= 0:
+            rot_text = chunk[rot_index:rot_index + 80]
+            rot_values = [float(v) for v in re.findall(r"[-+]?\d+(?:\.\d+)?", rot_text)]
+            if rot_values:
+                for index, value in enumerate(rot_values[:3]):
+                    rotation[index] = math.radians(value)
+                last_rotation = list(rotation)
+
+        points.append({
+            "location": pos_values[:3],
+            "rotation": rotation,
+        })
+
+    return points
+
+
+def apply_replay_point(scene, point):
+    sensor_name = getattr(scene, "mcp_replay_sensor_name", "Sensor_IMU")
+    if not bpy.data.objects.get(sensor_name):
+        bpy.ops.object.empty_add(type='PLAIN_AXES', location=(0, 0, 0))
+        obj = bpy.context.active_object
+        obj.name = sensor_name
+        obj.empty_display_size = 1.0
+
+    handle_sensor_apply_data({
+        "sensor_name": sensor_name,
+        "location": point.get("location", [0.0, 0.0, 0.0]),
+        "rotation": point.get("rotation", [0.0, 0.0, 0.0]),
+        "frame": scene.frame_current,
+        "insert_keyframe": getattr(scene, "mcp_replay_keyframes", False),
+        "position_scale": getattr(scene, "mcp_replay_position_scale", 1.0),
+    })
+
+
+def replay_timer():
+    global _replay_index, _replay_running, _replay_timer_registered
+    if not _replay_running:
+        _replay_timer_registered = False
+        return None
+
+    scene = bpy.context.scene
+    if not _replay_points:
+        _replay_running = False
+        _replay_timer_registered = False
+        scene.mcp_replay_running = False
+        return None
+
+    if _replay_index >= len(_replay_points):
+        _replay_index = 0
+
+    apply_replay_point(scene, _replay_points[_replay_index])
+    scene.mcp_replay_current_index = _replay_index + 1
+    _replay_index += 1
+
+    fps = max(1.0, float(getattr(scene, "mcp_replay_fps", 20)))
+    return 1.0 / fps
 
 
 # =============================================================================
@@ -595,7 +786,7 @@ def handle_sensor_apply_data(params):
         "rotation": list(obj.rotation_euler),
         "gravity": getattr(scene, "mcp_gravity", -9.86),
         "deadband": getattr(scene, "mcp_deadband", 0.15),
-        "gyro_deadband": getattr(scene, "mcp_gyro_deadband", 0.0),
+        "gyro_deadband": getattr(scene, "mcp_gyro_deadband", 0.01),
         "damping": getattr(scene, "mcp_damping", 0.995),
         "alpha": getattr(scene, "mcp_alpha", 0.98),
         "subtract_gravity": getattr(scene, "mcp_subtract_gravity", True),
@@ -610,6 +801,12 @@ def handle_sensor_apply_data(params):
         "cane_length": getattr(scene, "mcp_cane_length", 0.90),
         "sensor_position_from_tip": getattr(scene, "mcp_sensor_position_from_tip", 0.20),
         "sensor_to_tip": list(getattr(scene, "mcp_sensor_to_tip", (0.0, 0.0, 0.0))),
+        "axis_map_x": getattr(scene, "mcp_axis_map_x", "x"),
+        "axis_map_y": getattr(scene, "mcp_axis_map_y", "y"),
+        "axis_map_z": getattr(scene, "mcp_axis_map_z", "z"),
+        "axis_sign_x": getattr(scene, "mcp_axis_sign_x", 1.0),
+        "axis_sign_y": getattr(scene, "mcp_axis_sign_y", 1.0),
+        "axis_sign_z": getattr(scene, "mcp_axis_sign_z", 1.0),
         "record_keyframes": getattr(scene, "mcp_record_keyframes", False),
         "mode": getattr(scene, "mcp_sensor_mode", "mix"),
     }
@@ -927,6 +1124,229 @@ class MCP_OT_SetSensorInit(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MCP_OT_LoadReplayData(bpy.types.Operator):
+    bl_idname = "mcp.load_replay_data"
+    bl_label = "Load Replay Data"
+    bl_description = "Load bridge transform log data for replay without hardware"
+
+    def execute(self, context):
+        global _replay_points, _replay_index
+        scene = context.scene
+        file_path = bpy.path.abspath(scene.mcp_replay_file)
+        if not os.path.exists(file_path):
+            self.report({'ERROR'}, f"Replay file not found: {file_path}")
+            return {'CANCELLED'}
+
+        try:
+            _replay_points = parse_replay_transform_log(file_path)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to load replay data: {exc}")
+            return {'CANCELLED'}
+
+        _replay_index = 0
+        scene.mcp_replay_loaded_count = len(_replay_points)
+        scene.mcp_replay_current_index = 0
+        self.report({'INFO'}, f"Loaded {len(_replay_points)} replay points")
+        return {'FINISHED'}
+
+
+class MCP_OT_PlayReplayData(bpy.types.Operator):
+    bl_idname = "mcp.play_replay_data"
+    bl_label = "Play Replay"
+    bl_description = "Play loaded replay data into the sensor object"
+
+    def execute(self, context):
+        global _replay_running, _replay_timer_registered
+        scene = context.scene
+        if not _replay_points:
+            result = bpy.ops.mcp.load_replay_data()
+            if result != {'FINISHED'}:
+                return {'CANCELLED'}
+
+        _replay_running = True
+        if not _replay_timer_registered:
+            bpy.app.timers.register(replay_timer, first_interval=0.0)
+            _replay_timer_registered = True
+        scene.mcp_replay_running = True
+        self.report({'INFO'}, "Replay started")
+        return {'FINISHED'}
+
+
+class MCP_OT_StopReplayData(bpy.types.Operator):
+    bl_idname = "mcp.stop_replay_data"
+    bl_label = "Stop Replay"
+    bl_description = "Stop replay data playback"
+
+    def execute(self, context):
+        global _replay_running, _replay_timer_registered
+        _replay_running = False
+        _replay_timer_registered = False
+        context.scene.mcp_replay_running = False
+        self.report({'INFO'}, "Replay stopped")
+        return {'FINISHED'}
+
+
+class MCP_OT_ResetReplayData(bpy.types.Operator):
+    bl_idname = "mcp.reset_replay_data"
+    bl_label = "Reset Replay"
+    bl_description = "Reset replay to the first loaded sample"
+
+    def execute(self, context):
+        global _replay_index
+        _replay_index = 0
+        context.scene.mcp_replay_current_index = 0
+        if _replay_points:
+            apply_replay_point(context.scene, _replay_points[0])
+        self.report({'INFO'}, "Replay reset")
+        return {'FINISHED'}
+
+
+class MCP_OT_ToggleReplayInput(bpy.types.Operator):
+    bl_idname = "mcp.toggle_replay_input"
+    bl_label = "Replay Input"
+    bl_description = "Use test_data.md as a looping input source instead of live Arduino data"
+
+    def execute(self, context):
+        global _replay_running, _replay_timer_registered, _replay_points, _replay_index
+        global _running, _server_socket
+
+        scene = context.scene
+        if _replay_running:
+            _replay_running = False
+            _replay_timer_registered = False
+            scene.mcp_replay_running = False
+            self.report({'INFO'}, "Replay input stopped")
+            return {'FINISHED'}
+
+        if _running:
+            _running = False
+            if _server_socket:
+                try:
+                    _server_socket.close()
+                except Exception:
+                    pass
+
+        file_path = bpy.path.abspath(scene.mcp_replay_file)
+        if not os.path.exists(file_path):
+            self.report({'ERROR'}, f"Replay file not found: {file_path}")
+            return {'CANCELLED'}
+
+        try:
+            _replay_points = parse_replay_transform_log(file_path)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to load replay data: {exc}")
+            return {'CANCELLED'}
+
+        if not _replay_points:
+            self.report({'ERROR'}, "Replay file loaded, but no Pos/Rot samples were found")
+            return {'CANCELLED'}
+
+        _replay_index = 0
+        scene.mcp_replay_loaded_count = len(_replay_points)
+        scene.mcp_replay_current_index = 0
+        scene.mcp_replay_running = True
+        _replay_running = True
+
+        if not _replay_timer_registered:
+            bpy.app.timers.register(replay_timer, first_interval=0.0)
+            _replay_timer_registered = True
+
+        self.report({'INFO'}, f"Replay input started with {len(_replay_points)} samples")
+        return {'FINISHED'}
+
+
+class MCP_OT_PrintSensorSettings(bpy.types.Operator):
+    bl_idname = "mcp.print_sensor_settings"
+    bl_label = "Print Sensor Settings"
+    bl_description = "Print current sensor settings to the Blender system console"
+
+    def execute(self, context):
+        scene = context.scene
+        settings = {
+            "mode": getattr(scene, "mcp_sensor_mode", "mix"),
+            "gravity": getattr(scene, "mcp_gravity", -9.86),
+            "subtract_gravity": getattr(scene, "mcp_subtract_gravity", True),
+            "deadband": getattr(scene, "mcp_deadband", 0.15),
+            "gyro_deadband": getattr(scene, "mcp_gyro_deadband", 0.01),
+            "accel_gain": getattr(scene, "mcp_accel_gain", 1.0),
+            "accel_dt_scale": getattr(scene, "mcp_accel_dt_scale", 1.0),
+            "accel_position_mix": getattr(scene, "mcp_accel_position_mix", 0.0),
+            "velocity_damping": getattr(scene, "mcp_damping", 0.995),
+            "position_scale": getattr(scene, "mcp_position_scale", 1.0),
+            "axis_remap": {
+                "sensor_x": f"{getattr(scene, 'mcp_axis_sign_x', 1.0):g} -> {getattr(scene, 'mcp_axis_map_x', 'x')}",
+                "sensor_y": f"{getattr(scene, 'mcp_axis_sign_y', 1.0):g} -> {getattr(scene, 'mcp_axis_map_y', 'y')}",
+                "sensor_z": f"{getattr(scene, 'mcp_axis_sign_z', 1.0):g} -> {getattr(scene, 'mcp_axis_map_z', 'z')}",
+            },
+            "zupt_enabled": getattr(scene, "mcp_zupt_enabled", True),
+            "zupt_accel_threshold": getattr(scene, "mcp_zupt_accel_threshold", 0.35),
+            "zupt_gyro_threshold": getattr(scene, "mcp_zupt_gyro_threshold", 0.08),
+            "cane_contact_accel_threshold": getattr(scene, "mcp_cane_contact_accel_threshold", 0.80),
+            "cane_length": getattr(scene, "mcp_cane_length", 0.90),
+            "sensor_position_from_tip": getattr(scene, "mcp_sensor_position_from_tip", 0.20),
+            "sensor_to_tip": list(getattr(scene, "mcp_sensor_to_tip", (0.0, 0.0, 0.0))),
+        }
+        print("\n[MCP Sensor Settings]")
+        for key, value in settings.items():
+            print(f"  {key}: {value}")
+        self.report({'INFO'}, "Sensor settings printed to console")
+        return {'FINISHED'}
+
+
+class MCP_OT_ApplyStableRotationPreset(bpy.types.Operator):
+    bl_idname = "mcp.apply_stable_rotation_preset"
+    bl_label = "Stable Rotation Preset"
+    bl_description = "Apply the known-good double-integrate rotation settings"
+
+    def execute(self, context):
+        scene = context.scene
+        presets = load_sensor_presets()
+        apply_sensor_settings(scene, presets.get("stable_rotation", BUILTIN_SENSOR_PRESETS["stable_rotation"]))
+        scene.mcp_reset_requested = True
+        scene.mcp_init_requested = True
+        self.report({'INFO'}, "Stable rotation preset applied")
+        return {'FINISHED'}
+
+
+class MCP_OT_ApplySensorPreset(bpy.types.Operator):
+    bl_idname = "mcp.apply_sensor_preset"
+    bl_label = "Apply Preset"
+    bl_description = "Apply a saved sensor preset by name"
+
+    def execute(self, context):
+        scene = context.scene
+        name = sensor_preset_name(scene)
+        presets = load_sensor_presets()
+        if name not in presets:
+            self.report({'ERROR'}, f"Sensor preset not found: {name}")
+            return {'CANCELLED'}
+        apply_sensor_settings(scene, presets[name])
+        scene.mcp_reset_requested = True
+        scene.mcp_init_requested = True
+        self.report({'INFO'}, f"Applied sensor preset: {name}")
+        return {'FINISHED'}
+
+
+class MCP_OT_SaveSensorPreset(bpy.types.Operator):
+    bl_idname = "mcp.save_sensor_preset"
+    bl_label = "Save Preset"
+    bl_description = "Save current sensor settings to sensor_presets.json"
+
+    def execute(self, context):
+        scene = context.scene
+        name = sensor_preset_name(scene)
+        presets = load_sensor_presets()
+        presets[name] = capture_sensor_settings(scene)
+        try:
+            save_sensor_presets(presets)
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to save preset: {exc}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Saved sensor preset: {name}")
+        print(f"[MCP] Saved sensor preset '{name}' to {SENSOR_PRESET_FILE}")
+        return {'FINISHED'}
+
+
 class MCP_PT_Panel(bpy.types.Panel):
     bl_label = "MCP Server"
     bl_idname = "MCP_PT_Panel"
@@ -948,10 +1368,17 @@ class MCP_PT_Panel(bpy.types.Panel):
 
         # Status
         layout.separator()
-        if _running:
-            layout.label(text="● Server Running", icon='CHECKMARK')
-            layout.operator("mcp.stop_server", text="Stop Server", icon='CANCEL')
-            
+        if _running or _replay_running:
+            if _replay_running:
+                layout.label(
+                    text=f"● Replay Input Running ({scene.mcp_replay_current_index}/{scene.mcp_replay_loaded_count})",
+                    icon='PLAY'
+                )
+                layout.operator("mcp.toggle_replay_input", text="Stop Replay Input", icon='CANCEL')
+            else:
+                layout.label(text="● Server Running", icon='CHECKMARK')
+                layout.operator("mcp.stop_server", text="Stop Server", icon='CANCEL')
+
             # Real-time Sensor Controls
             layout.separator()
             ctrl_box = layout.box()
@@ -972,6 +1399,22 @@ class MCP_PT_Panel(bpy.types.Panel):
             col.prop(scene, "mcp_position_scale", text="Position Scale")
             col.prop(scene, "mcp_record_keyframes", text="Record Keyframes")
 
+            axis_box = ctrl_box.box()
+            axis_box.label(text="Axis Remap", icon='ORIENTATION_LOCAL')
+            axis_col = axis_box.column(align=True)
+            row = axis_col.row(align=True)
+            row.label(text="Sensor X")
+            row.prop(scene, "mcp_axis_sign_x", text="")
+            row.prop(scene, "mcp_axis_map_x", text="to")
+            row = axis_col.row(align=True)
+            row.label(text="Sensor Y")
+            row.prop(scene, "mcp_axis_sign_y", text="")
+            row.prop(scene, "mcp_axis_map_y", text="to")
+            row = axis_col.row(align=True)
+            row.label(text="Sensor Z")
+            row.prop(scene, "mcp_axis_sign_z", text="")
+            row.prop(scene, "mcp_axis_map_z", text="to")
+
             cane_box = ctrl_box.box()
             cane_box.label(text="Cane Model", icon='IPO_EASE_IN_OUT')
             cane_col = cane_box.column(align=True)
@@ -987,9 +1430,20 @@ class MCP_PT_Panel(bpy.types.Panel):
             row = ctrl_box.row(align=True)
             row.operator("mcp.set_sensor_init", text="Set Init", icon='CENTER_ONLY')
             row.operator("mcp.reset_sensor", text="Reset State", icon='FILE_REFRESH')
+
+            preset_box = ctrl_box.box()
+            preset_box.label(text="Presets", icon='PRESET')
+            preset_box.prop(scene, "mcp_sensor_preset_name", text="Name")
+            row = preset_box.row(align=True)
+            row.operator("mcp.apply_sensor_preset", text="Apply", icon='RECOVER_LAST')
+            row.operator("mcp.save_sensor_preset", text="Save", icon='FILE_TICK')
+            preset_box.operator("mcp.apply_stable_rotation_preset", text="Apply stable_rotation", icon='ORIENTATION_GIMBAL')
+            ctrl_box.operator("mcp.print_sensor_settings", text="Print Settings", icon='CONSOLE')
         else:
             layout.label(text="○ Server Stopped", icon='X')
-            layout.operator("mcp.start_server", text="Start Server", icon='PLAY')
+            row = layout.row(align=True)
+            row.operator("mcp.start_server", text="Start Server", icon='PLAY')
+            row.operator("mcp.toggle_replay_input", text="Replay Input", icon='FILE_MOVIE')
 
         # Info
         layout.separator()
@@ -1008,6 +1462,15 @@ classes = (
     MCP_OT_StopServer,
     MCP_OT_ResetSensor,
     MCP_OT_SetSensorInit,
+    MCP_OT_LoadReplayData,
+    MCP_OT_PlayReplayData,
+    MCP_OT_StopReplayData,
+    MCP_OT_ResetReplayData,
+    MCP_OT_ToggleReplayInput,
+    MCP_OT_PrintSensorSettings,
+    MCP_OT_ApplyStableRotationPreset,
+    MCP_OT_ApplySensorPreset,
+    MCP_OT_SaveSensorPreset,
     MCP_PT_Panel,
 )
 
@@ -1028,6 +1491,52 @@ def register():
         max=65535,
         description="Server port number"
     )
+    bpy.types.Scene.mcp_replay_file = bpy.props.StringProperty(
+        name="Replay File",
+        default="/Users/er/Blender_Dev/MCP/Blender/test_data.md",
+        subtype='FILE_PATH',
+        description="Bridge transform log to replay without hardware"
+    )
+    bpy.types.Scene.mcp_replay_sensor_name = bpy.props.StringProperty(
+        name="Replay Target",
+        default="Sensor_IMU",
+        description="Object that receives replayed transform data"
+    )
+    bpy.types.Scene.mcp_replay_fps = bpy.props.IntProperty(
+        name="Replay FPS",
+        default=20,
+        min=1,
+        max=240,
+        description="Playback rate for replay data"
+    )
+    bpy.types.Scene.mcp_replay_position_scale = bpy.props.FloatProperty(
+        name="Replay Scale",
+        default=1.0,
+        min=0.0,
+        description="Position scale applied only to replay data"
+    )
+    bpy.types.Scene.mcp_replay_loop = bpy.props.BoolProperty(
+        name="Loop Replay",
+        default=False,
+        description="Loop replay data when it reaches the end"
+    )
+    bpy.types.Scene.mcp_replay_keyframes = bpy.props.BoolProperty(
+        name="Replay Keyframes",
+        default=False,
+        description="Insert keyframes while replaying data"
+    )
+    bpy.types.Scene.mcp_replay_loaded_count = bpy.props.IntProperty(
+        name="Replay Loaded Count",
+        default=0
+    )
+    bpy.types.Scene.mcp_replay_current_index = bpy.props.IntProperty(
+        name="Replay Current Index",
+        default=0
+    )
+    bpy.types.Scene.mcp_replay_running = bpy.props.BoolProperty(
+        name="Replay Running",
+        default=False
+    )
     bpy.types.Scene.mcp_reset_requested = bpy.props.BoolProperty(
         name="Reset Requested",
         default=False
@@ -1035,6 +1544,11 @@ def register():
     bpy.types.Scene.mcp_init_requested = bpy.props.BoolProperty(
         name="Init Requested",
         default=False
+    )
+    bpy.types.Scene.mcp_sensor_preset_name = bpy.props.StringProperty(
+        name="Sensor Preset",
+        default="stable_rotation",
+        description="Preset name to apply or save in sensor_presets.json"
     )
     bpy.types.Scene.mcp_gravity = bpy.props.FloatProperty(
         name="Gravity Magnitude",
@@ -1062,7 +1576,7 @@ def register():
     )
     bpy.types.Scene.mcp_gyro_deadband = bpy.props.FloatProperty(
         name="Gyro Deadband",
-        default=0.0,
+        default=0.01,
         min=0.0,
         description="Noise threshold below which gyro angular velocity is zeroed before integrating rotation"
     )
@@ -1144,6 +1658,50 @@ def register():
         subtype='XYZ',
         description="Vector from IMU sensor to cane tip in the sensor/body coordinate frame, in metres. Leave zero to use Sensor Position From Tip on local +X"
     )
+    axis_items = [
+        ('x', 'X', 'Map this sensor axis to output X'),
+        ('y', 'Y', 'Map this sensor axis to output Y'),
+        ('z', 'Z', 'Map this sensor axis to output Z'),
+    ]
+    bpy.types.Scene.mcp_axis_map_x = bpy.props.EnumProperty(
+        name="Sensor X To",
+        items=axis_items,
+        default='x',
+        description="Output axis that receives sensor X"
+    )
+    bpy.types.Scene.mcp_axis_map_y = bpy.props.EnumProperty(
+        name="Sensor Y To",
+        items=axis_items,
+        default='y',
+        description="Output axis that receives sensor Y"
+    )
+    bpy.types.Scene.mcp_axis_map_z = bpy.props.EnumProperty(
+        name="Sensor Z To",
+        items=axis_items,
+        default='z',
+        description="Output axis that receives sensor Z"
+    )
+    bpy.types.Scene.mcp_axis_sign_x = bpy.props.FloatProperty(
+        name="Sensor X Sign",
+        default=1.0,
+        min=-1.0,
+        max=1.0,
+        description="Sign applied to sensor X before remapping"
+    )
+    bpy.types.Scene.mcp_axis_sign_y = bpy.props.FloatProperty(
+        name="Sensor Y Sign",
+        default=1.0,
+        min=-1.0,
+        max=1.0,
+        description="Sign applied to sensor Y before remapping"
+    )
+    bpy.types.Scene.mcp_axis_sign_z = bpy.props.FloatProperty(
+        name="Sensor Z Sign",
+        default=1.0,
+        min=-1.0,
+        max=1.0,
+        description="Sign applied to sensor Z before remapping"
+    )
     bpy.types.Scene.mcp_sensor_mode = bpy.props.EnumProperty(
         name="Processing Mode",
         items=[
@@ -1152,7 +1710,7 @@ def register():
             ('mix', 'Mix', 'Complementary accel/gyro/mag mix for rotation, world-frame double-integration for position'),
             ('cane', 'Cane', 'Walking-cane model with ZUPT and inverted-pendulum velocity updates')
         ],
-        default='mix',
+        default='double-integrate',
         description="Sensor processing mode"
     )
 
@@ -1166,8 +1724,18 @@ def unregister():
 
     del bpy.types.Scene.mcp_host
     del bpy.types.Scene.mcp_port
+    del bpy.types.Scene.mcp_replay_file
+    del bpy.types.Scene.mcp_replay_sensor_name
+    del bpy.types.Scene.mcp_replay_fps
+    del bpy.types.Scene.mcp_replay_position_scale
+    del bpy.types.Scene.mcp_replay_loop
+    del bpy.types.Scene.mcp_replay_keyframes
+    del bpy.types.Scene.mcp_replay_loaded_count
+    del bpy.types.Scene.mcp_replay_current_index
+    del bpy.types.Scene.mcp_replay_running
     del bpy.types.Scene.mcp_reset_requested
     del bpy.types.Scene.mcp_init_requested
+    del bpy.types.Scene.mcp_sensor_preset_name
     del bpy.types.Scene.mcp_gravity
     del bpy.types.Scene.mcp_subtract_gravity
     del bpy.types.Scene.mcp_alpha
@@ -1186,6 +1754,12 @@ def unregister():
     del bpy.types.Scene.mcp_cane_length
     del bpy.types.Scene.mcp_sensor_position_from_tip
     del bpy.types.Scene.mcp_sensor_to_tip
+    del bpy.types.Scene.mcp_axis_map_x
+    del bpy.types.Scene.mcp_axis_map_y
+    del bpy.types.Scene.mcp_axis_map_z
+    del bpy.types.Scene.mcp_axis_sign_x
+    del bpy.types.Scene.mcp_axis_sign_y
+    del bpy.types.Scene.mcp_axis_sign_z
     del bpy.types.Scene.mcp_sensor_mode
 
 

@@ -1,0 +1,31 @@
+{
+  "stable_rotation": {
+    "accel_dt_scale": 1.0,
+    "accel_gain": 1.0,
+    "accel_position_mix": 0.0,
+    "axis_map_x": "x",
+    "axis_map_y": "y",
+    "axis_map_z": "z",
+    "axis_sign_x": 1.0,
+    "axis_sign_y": 1.0,
+    "axis_sign_z": 1.0,
+    "cane_contact_accel_threshold": 0.8,
+    "cane_length": 0.9,
+    "deadband": 0.15,
+    "gravity": -9.86,
+    "gyro_deadband": 0.01,
+    "mode": "double-integrate",
+    "position_scale": 1.0,
+    "sensor_position_from_tip": 0.2,
+    "sensor_to_tip": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "subtract_gravity": true,
+    "velocity_damping": 0.995,
+    "zupt_accel_threshold": 0.35,
+    "zupt_enabled": true,
+    "zupt_gyro_threshold": 0.08
+  }
+}

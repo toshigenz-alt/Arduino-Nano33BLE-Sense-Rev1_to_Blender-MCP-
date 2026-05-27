@@ -114,6 +114,26 @@ def vector_norm(values: list[float]) -> float:
     return math.sqrt(sum(v * v for v in values))
 
 
+def axis_sign(value) -> float:
+    try:
+        return -1.0 if float(value) < 0 else 1.0
+    except (TypeError, ValueError):
+        return -1.0 if str(value).strip().startswith("-") else 1.0
+
+
+def remap_sensor_vector(
+    values: list[float],
+    target_axes: list[str],
+    signs: list,
+) -> list[float]:
+    axis_index = {"x": 0, "y": 1, "z": 2}
+    remapped = [0.0, 0.0, 0.0]
+    for source_index, target_axis in enumerate(target_axes):
+        target_index = axis_index.get(str(target_axis).lower(), source_index)
+        remapped[target_index] += values[source_index] * axis_sign(signs[source_index])
+    return remapped
+
+
 def cross(a: list[float], b: list[float]) -> list[float]:
     return [
         a[1] * b[2] - a[2] * b[1],
@@ -165,7 +185,7 @@ class SensorState:
         self.rot_offset = [0.0, 0.0, 0.0]
         self.gravity_mag = -9.86
         self.deadband = 0.15
-        self.gyro_deadband = 0.0
+        self.gyro_deadband = 0.01
         self.damping = 0.995
         self.alpha = None
         self.subtract_gravity = None
@@ -180,6 +200,12 @@ class SensorState:
         self.cane_length = 0.90
         self.sensor_position_from_tip = 0.20
         self.sensor_to_tip = None
+        self.axis_map_x = "x"
+        self.axis_map_y = "y"
+        self.axis_map_z = "z"
+        self.axis_sign_x = 1.0
+        self.axis_sign_y = 1.0
+        self.axis_sign_z = 1.0
         self.mode_override = None
 
     def reset(self):
@@ -925,6 +951,12 @@ def sensor_apply_data(
     active_accel_gain = state.accel_gain if state.accel_gain is not None else 1.0
     active_accel_dt = dt * (state.accel_dt_scale if state.accel_dt_scale is not None else 1.0)
     active_accel_position_mix = state.accel_position_mix
+    axis_targets = [state.axis_map_x, state.axis_map_y, state.axis_map_z]
+    axis_signs = [state.axis_sign_x, state.axis_sign_y, state.axis_sign_z]
+    accel = remap_sensor_vector(accel, axis_targets, axis_signs)
+    gyro = remap_sensor_vector(gyro, axis_targets, axis_signs)
+    if mag:
+        mag = remap_sensor_vector(mag, axis_targets, axis_signs)
     sensor_to_tip = state.sensor_to_tip
     if not sensor_to_tip or vector_norm(sensor_to_tip) == 0:
         sensor_to_tip_distance = min(state.sensor_position_from_tip, state.cane_length) if state.cane_length > 0 else state.sensor_position_from_tip
@@ -1151,6 +1183,18 @@ def sensor_apply_data(
             state.sensor_position_from_tip = res["sensor_position_from_tip"]
         if "sensor_to_tip" in res:
             state.sensor_to_tip = res["sensor_to_tip"]
+        if "axis_map_x" in res:
+            state.axis_map_x = res["axis_map_x"]
+        if "axis_map_y" in res:
+            state.axis_map_y = res["axis_map_y"]
+        if "axis_map_z" in res:
+            state.axis_map_z = res["axis_map_z"]
+        if "axis_sign_x" in res:
+            state.axis_sign_x = res["axis_sign_x"]
+        if "axis_sign_y" in res:
+            state.axis_sign_y = res["axis_sign_y"]
+        if "axis_sign_z" in res:
+            state.axis_sign_z = res["axis_sign_z"]
         if "mode" in res:
             state.mode_override = res["mode"]
 
