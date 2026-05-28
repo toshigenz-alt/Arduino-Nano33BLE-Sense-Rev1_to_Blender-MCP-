@@ -1,15 +1,12 @@
 """
-Blender MCP Server — Model Context Protocol server for AI-driven Blender control.
+Blender sensor processing and socket command helpers.
 
-This server bridges AI clients (Claude, Cursor, VS Code) to Blender via the
-MCP protocol, with full sensor data visualization support (IMU fusion).
+The current live pipeline is MQTT based. The MQTT-to-Blender bridge imports the
+sensor processing functions in this module and then sends newline-delimited JSON
+commands to the Blender addon socket.
 
-Usage:
-    uv run server.py                    # stdio transport (for Claude/Cursor)
-    uv run server.py --transport http   # HTTP transport
-
-Or with mcp CLI:
-    uv run mcp dev server.py
+The older MCP tool decorators are kept optional so historical MCP clients can
+still be used when `mcp[cli]` is installed, but MQTT no longer depends on MCP.
 """
 
 import json
@@ -18,15 +15,29 @@ import socket
 import csv
 import io
 from typing import Optional
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:
+    FastMCP = None
 
 # =============================================================================
 # FastMCP Server
 # =============================================================================
 
+class _NoMCP:
+    def tool(self):
+        return lambda func: func
+
+    def resource(self, _uri):
+        return lambda func: func
+
+    def run(self, *args, **kwargs):
+        raise RuntimeError("MCP support is not installed. Use the MQTT bridge or install mcp[cli].")
+
+
 mcp = FastMCP(
-    "Blender MCP",
-    instructions="""MCP server for controlling Blender and visualizing sensor data.
+    "Blender Sensor Bridge",
+    instructions="""Tools for controlling Blender and visualizing sensor data.
     
     GENERAL TOOLS: Create/modify/delete 3D objects, set materials, add modifiers,
     control camera/lighting, render scenes, and execute arbitrary Python code.
@@ -38,7 +49,7 @@ mcp = FastMCP(
     - double-integrate: double-integrate accel, single-integrate gyro
     - mix: complementary accel/gyro/mag filter (recommended)
     """
-)
+) if FastMCP else _NoMCP()
 
 
 # =============================================================================
@@ -78,7 +89,7 @@ def send_command(command: str, params: dict = None, timeout: float = 60.0) -> di
             return {"error": "No response from Blender"}
 
     except ConnectionRefusedError:
-        return {"error": "Cannot connect to Blender. Make sure the MCP Addon is running (View3D > Sidebar > MCP > Start Server)"}
+        return {"error": "Cannot connect to Blender. Make sure the Blender Sensor addon socket is running"}
     except socket.timeout:
         return {"error": f"Connection to Blender timed out ({timeout}s). The operation may still be running."}
     except Exception as e:

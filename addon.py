@@ -1,19 +1,19 @@
 """
-Blender MCP Addon — TCP Socket Server for AI-driven Blender control.
+Blender Sensor Bridge Addon — TCP Socket Server for live sensor control.
 
-This addon creates a TCP socket server inside Blender that listens for
-JSON commands from the MCP server and executes them on Blender's main thread.
+This addon creates a TCP socket server inside Blender that listens for JSON
+commands from mqtt_blender_bridge.py and executes them on Blender's main thread.
 
 Install: Edit > Preferences > Add-ons > Install > select this file
 """
 
 bl_info = {
-    "name": "Blender MCP Server",
-    "author": "Blender MCP",
-    "description": "MCP (Model Context Protocol) server for AI-driven Blender control with sensor data visualization",
+    "name": "Blender Sensor Bridge",
+    "author": "Blender Sensor Bridge",
+    "description": "Socket server for MQTT-driven Blender sensor visualization",
     "blender": (3, 6, 0),
     "version": (1, 0, 0),
-    "location": "View3D > Sidebar > MCP",
+    "location": "View3D > Sidebar > Sensor",
     "category": "Interface",
 }
 
@@ -88,7 +88,7 @@ def load_sensor_presets():
     except FileNotFoundError:
         pass
     except Exception as exc:
-        print(f"[MCP] Failed to load sensor presets: {exc}")
+        print(f"[Sensor Bridge] Failed to load sensor presets: {exc}")
     return presets
 
 
@@ -703,12 +703,12 @@ def handle_sensor_import_log(params):
     - mix: complementary accel/gyro/mag filter
     """
     sensor_name = params.get("sensor_name")
-    data = params.get("data")  # Pre-parsed data from MCP server
+    data = params.get("data")  # Pre-parsed data from the Python bridge
 
     if not sensor_name:
         return {"error": "Parameter 'sensor_name' is required"}
     if not data:
-        return {"error": "Parameter 'data' is required (pre-parsed from MCP server)"}
+        return {"error": "Parameter 'data' is required (pre-parsed from the Python bridge)"}
 
     obj = bpy.data.objects.get(sensor_name)
     if not obj:
@@ -960,7 +960,7 @@ def handle_client(client_socket, addr):
     """Handle a connected client."""
     global _command_id
 
-    print(f"[MCP Addon] Client connected: {addr}")
+    print(f"[Sensor Bridge] Client connected: {addr}")
     buffer = b""
 
     try:
@@ -1013,10 +1013,10 @@ def handle_client(client_socket, addr):
                 client_socket.sendall(response_bytes)
 
     except (ConnectionResetError, BrokenPipeError, OSError) as e:
-        print(f"[MCP Addon] Client disconnected: {addr} ({e})")
+        print(f"[Sensor Bridge] Client disconnected: {addr} ({e})")
     finally:
         client_socket.close()
-        print(f"[MCP Addon] Client closed: {addr}")
+        print(f"[Sensor Bridge] Client closed: {addr}")
 
 
 def server_loop(host, port):
@@ -1030,7 +1030,7 @@ def server_loop(host, port):
     try:
         _server_socket.bind((host, port))
         _server_socket.listen(5)
-        print(f"[MCP Addon] Server listening on {host}:{port}")
+        print(f"[Sensor Bridge] Server listening on {host}:{port}")
 
         while _running:
             try:
@@ -1042,11 +1042,11 @@ def server_loop(host, port):
             except OSError:
                 break
     except Exception as e:
-        print(f"[MCP Addon] Server error: {e}")
+        print(f"[Sensor Bridge] Server error: {e}")
     finally:
         if _server_socket:
             _server_socket.close()
-        print("[MCP Addon] Server stopped")
+        print("[Sensor Bridge] Server stopped")
 
 
 # =============================================================================
@@ -1055,8 +1055,8 @@ def server_loop(host, port):
 
 class MCP_OT_StartServer(bpy.types.Operator):
     bl_idname = "mcp.start_server"
-    bl_label = "Start MCP Server"
-    bl_description = "Start the MCP TCP socket server"
+    bl_label = "Start Sensor Socket"
+    bl_description = "Start the Blender sensor TCP socket server"
 
     def execute(self, context):
         global _server_thread, _running
@@ -1075,14 +1075,14 @@ class MCP_OT_StartServer(bpy.types.Operator):
         # Register timer for main thread command processing
         bpy.app.timers.register(process_timer, first_interval=0.1)
 
-        self.report({'INFO'}, f"MCP Server started on {host}:{port}")
+        self.report({'INFO'}, f"Sensor socket started on {host}:{port}")
         return {'FINISHED'}
 
 
 class MCP_OT_StopServer(bpy.types.Operator):
     bl_idname = "mcp.stop_server"
-    bl_label = "Stop MCP Server"
-    bl_description = "Stop the MCP TCP socket server"
+    bl_label = "Stop Sensor Socket"
+    bl_description = "Stop the Blender sensor TCP socket server"
 
     def execute(self, context):
         global _running, _server_socket
@@ -1098,7 +1098,7 @@ class MCP_OT_StopServer(bpy.types.Operator):
             except Exception:
                 pass
 
-        self.report({'INFO'}, "MCP Server stopped")
+        self.report({'INFO'}, "Sensor socket stopped")
         return {'FINISHED'}
 
 
@@ -1286,7 +1286,7 @@ class MCP_OT_PrintSensorSettings(bpy.types.Operator):
             "sensor_position_from_tip": getattr(scene, "mcp_sensor_position_from_tip", 0.20),
             "sensor_to_tip": list(getattr(scene, "mcp_sensor_to_tip", (0.0, 0.0, 0.0))),
         }
-        print("\n[MCP Sensor Settings]")
+        print("\n[Sensor Bridge Settings]")
         for key, value in settings.items():
             print(f"  {key}: {value}")
         self.report({'INFO'}, "Sensor settings printed to console")
@@ -1343,16 +1343,16 @@ class MCP_OT_SaveSensorPreset(bpy.types.Operator):
             self.report({'ERROR'}, f"Failed to save preset: {exc}")
             return {'CANCELLED'}
         self.report({'INFO'}, f"Saved sensor preset: {name}")
-        print(f"[MCP] Saved sensor preset '{name}' to {SENSOR_PRESET_FILE}")
+        print(f"[Sensor Bridge] Saved sensor preset '{name}' to {SENSOR_PRESET_FILE}")
         return {'FINISHED'}
 
 
 class MCP_PT_Panel(bpy.types.Panel):
-    bl_label = "MCP Server"
+    bl_label = "Sensor Bridge"
     bl_idname = "MCP_PT_Panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'MCP'
+    bl_category = 'Sensor'
 
     def draw(self, context):
         layout = self.layout
@@ -1376,8 +1376,8 @@ class MCP_PT_Panel(bpy.types.Panel):
                 )
                 layout.operator("mcp.toggle_replay_input", text="Stop Replay Input", icon='CANCEL')
             else:
-                layout.label(text="● Server Running", icon='CHECKMARK')
-                layout.operator("mcp.stop_server", text="Stop Server", icon='CANCEL')
+                layout.label(text="● Sensor Socket Running", icon='CHECKMARK')
+                layout.operator("mcp.stop_server", text="Stop Socket", icon='CANCEL')
 
             # Real-time Sensor Controls
             layout.separator()
@@ -1440,9 +1440,9 @@ class MCP_PT_Panel(bpy.types.Panel):
             preset_box.operator("mcp.apply_stable_rotation_preset", text="Apply stable_rotation", icon='ORIENTATION_GIMBAL')
             ctrl_box.operator("mcp.print_sensor_settings", text="Print Settings", icon='CONSOLE')
         else:
-            layout.label(text="○ Server Stopped", icon='X')
+            layout.label(text="○ Sensor Socket Stopped", icon='X')
             row = layout.row(align=True)
-            row.operator("mcp.start_server", text="Start Server", icon='PLAY')
+            row.operator("mcp.start_server", text="Start Socket", icon='PLAY')
             row.operator("mcp.toggle_replay_input", text="Replay Input", icon='FILE_MOVIE')
 
         # Info

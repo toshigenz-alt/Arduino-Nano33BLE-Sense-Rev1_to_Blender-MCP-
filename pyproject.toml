@@ -1,12 +1,13 @@
 [project]
 name = "blender-mcp"
 version = "1.0.0"
-description = "MCP (Model Context Protocol) server for Blender — control Blender via AI with sensor data visualization"
+description = "MQTT sensor bridge for driving Blender digital twins from InfluxDB sensor data"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.0.0",
+    "paho-mqtt>=2.1.0",
     "pyserial>=3.5",
+    "requests>=2.31.0",
 ]
 
 [build-system]
@@ -15,4 +16,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-

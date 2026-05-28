@@ -16,3 +16,4 @@ backups/*
 # Local environment
 .env
 .env.*
+!.env.example
